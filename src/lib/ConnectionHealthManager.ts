@@ -15,140 +15,193 @@ export class ConnectionHealthManager extends EventEmitter {
   private keepAliveTimer?: NodeJS.Timeout;
   private healthCheckTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
-  private heartbeatTimeoutTimer?: NodeJS.Timeout;
-
-  private keepAliveOptions: KeepAliveOptions;
-  private healthMonitorOptions: HealthMonitorOptions;
-  private reconnectOptions: ReconnectOptions;
-
-  private reconnectAttemptCount: number = 0;
-  private lastActivityTime: number = Date.now();
-  private heartbeatSequence: number = 0;
-  private reconnectStartTime?: number;
-
-  private isRunning: boolean = false;
-  private isReconnecting: boolean = false;
-  private keepAliveFunction?: () => void;
-  private reconnectFunction?: () => void;
-  private disconnectFunction?: (code?: number, reason?: string) => void;
+  private activityTimestamp: number;
+  private consecutiveHealthChecksFailed = 0;
+  private reconnectAttempts = 0;
+  private socket: WebSocket | null = null;
+  private isPaused = false;
+  private options: ConnectionHealthOptions;
 
   /**
-   * Creates a new ConnectionHealthManager instance.
-   *
-   * @param options - Connection health configuration options
-   * @param defaultKeepAliveInterval - Default KeepAlive interval in milliseconds (depends on client type)
+   * Health state enum
    */
-  constructor(options: ConnectionHealthOptions = {}, defaultKeepAliveInterval: number = 10000) {
+  public readonly HealthState = {
+    HEALTHY: "healthy" as const,
+    DEGRADED: "degraded" as const,
+    UNHEALTHY: "unhealthy" as const,
+  };
+
+  constructor(options: ConnectionHealthOptions) {
     super();
-
-    // Merge with defaults
-    this.keepAliveOptions = {
-      enabled: false,
-      interval: defaultKeepAliveInterval,
-      ...options.keepAlive,
-    };
-
-    this.healthMonitorOptions = {
-      enabled: false,
-      heartbeatInterval: 5000,
-      heartbeatTimeout: 10000,
-      ...options.healthMonitor,
-    };
-
-    this.reconnectOptions = {
-      enabled: false,
-      maxAttempts: 5,
-      backoffStrategy: BackoffStrategy.Exponential,
-      initialDelay: 1000,
-      maxDelay: 30000,
-      stepDelay: 1000,
-      ...options.reconnect,
-    };
-
-    // Validate health monitor timeout
-    if (this.healthMonitorOptions.heartbeatTimeout <= this.healthMonitorOptions.heartbeatInterval) {
-      console.warn(
-        `Health monitor timeout (${this.healthMonitorOptions.heartbeatTimeout}ms) should be greater than interval (${this.healthMonitorOptions.heartbeatInterval}ms)`
-      );
-    }
+    this.options = options;
+    this.activityTimestamp = Date.now();
   }
 
   /**
-   * Sets the function to call for sending KeepAlive messages.
+   * Attach a WebSocket socket to this health manager
    */
-  public setKeepAliveFunction(fn: () => void): void {
-    this.keepAliveFunction = fn;
+  public attach(socket: WebSocket): void {
+    this.socket = socket;
+    this.setupSocketListeners();
   }
 
   /**
-   * Sets the function to call for reconnection attempts.
+   * Record socket activity (called when data is sent/received)
    */
-  public setReconnectFunction(fn: () => void): void {
-    this.reconnectFunction = fn;
+  public recordActivity(): void {
+    this.activityTimestamp = Date.now();
+    this.consecutiveHealthChecksFailed = 0;
+    this.reconnectAttempts = 0;
   }
 
   /**
-   * Sets the function to call for disconnection.
-   */
-  public setDisconnectFunction(fn: (code?: number, reason?: string) => void): void {
-    this.disconnectFunction = fn;
-  }
-
-  /**
-   * Starts all health management features.
+   * Start health monitoring and KeepAlive
    */
   public start(): void {
-    if (this.isRunning) {
-      return;
-    }
+    if (this.isPaused) return;
 
-    this.isRunning = true;
-
-    if (this.keepAliveOptions.enabled && this.keepAliveFunction) {
-      this.startKeepAlive();
-    }
-
-    if (this.healthMonitorOptions.enabled) {
-      this.startHealthMonitor();
-    }
+    this.startKeepAlive();
+    this.startHealthChecks();
   }
 
   /**
-   * Stops all health management features.
+   * Pause health monitoring (e.g., during manual reconnection)
+   */
+  public pause(): void {
+    this.isPaused = true;
+    this.stopKeepAlive();
+    this.stopHealthChecks();
+    this.stopReconnectAttempts();
+  }
+
+  /**
+   * Resume health monitoring
+   */
+  public resume(): void {
+    this.isPaused = false;
+    this.start();
+  }
+
+  /**
+   * Stop health monitoring and clean up timers
    */
   public stop(): void {
-    if (!this.isRunning) {
-      return;
+    this.isPaused = true;
+    this.stopKeepAlive();
+    this.stopHealthChecks();
+    this.stopReconnectAttempts();
+  }
+
+  /**
+   * Get current health status
+   */
+  public getHealthStatus(): { state: string; lastActivity: number } {
+    const timeSinceActivity = Date.now() - this.activityTimestamp;
+    const { healthCheck, keepAlive } = this.options;
+
+    let state = this.HealthState.HEALTHY;
+    
+    if (timeSinceActivity > healthCheck.unhealthyThreshold) {
+      state = this.HealthState.UNHEALTHY;
+    } else if (timeSinceActivity > healthCheck.degradedThreshold) {
+      state = this.HealthState.DEGRADED;
     }
 
-    this.isRunning = false;
-    this.stopKeepAlive();
-    this.stopHealthMonitor();
-    this.stopReconnection();
+    return {
+      state,
+      lastActivity: timeSinceActivity,
+    };
   }
 
   /**
-   * Starts automatic KeepAlive messages.
+   * Update configuration options
+   */
+  public updateOptions(options: Partial<ConnectionHealthOptions>): void {
+    this.options = { ...this.options, ...options };
+    
+    // Restart with new options if not paused
+    if (!this.isPaused) {
+      this.stop();
+      this.start();
+    }
+  }
+
+  /**
+   * Get the configured KeepAlive interval (override in subclasses)
+   */
+  protected getKeepAliveInterval(): number {
+    return this.options.keepAlive.interval;
+  }
+
+  /**
+   * Get the message to send for KeepAlive (override in subclasses)
+   */
+  protected getKeepAliveMessage(): any {
+    return this.options.keepAlive.message;
+  }
+
+  /**
+   * Setup socket event listeners
+   */
+  private setupSocketListeners(): void {
+    if (!this.socket) return;
+
+    this.socket.addEventListener("open", () => {
+      this.emit("connection:opened");
+      this.recordActivity();
+      this.startKeepAlive();
+      this.startHealthChecks();
+      this.reconnectAttempts = 0;
+    });
+
+    this.socket.addEventListener("message", () => {
+      this.recordActivity();
+    });
+
+    this.socket.addEventListener("error", (error) => {
+      this.emit("connection:error", error);
+      this.pause();
+      
+      if (this.options.reconnect.enabled) {
+        this.scheduleReconnect();
+      }
+    });
+
+    this.socket.addEventListener("close", (event) => {
+      this.emit("connection:closed", event);
+      this.pause();
+      
+      if (!event.wasClean && this.options.reconnect.enabled) {
+        this.scheduleReconnect();
+      }
+    });
+  }
+
+  /**
+   * Start KeepAlive mechanism
    */
   private startKeepAlive(): void {
+    if (!this.options.keepAlive.enabled || this.isPaused) return;
+
     this.stopKeepAlive();
 
+    const interval = this.getKeepAliveInterval();
+    
     this.keepAliveTimer = setInterval(() => {
-      if (this.keepAliveFunction) {
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
         try {
-          this.keepAliveFunction();
-          this.emit("KeepAliveSent", {
-            timestamp: Date.now(),
-          });
+          const message = this.getKeepAliveMessage();
+          this.socket.send(typeof message === "string" ? message : JSON.stringify(message));
+          this.emit("keepalive:sent");
         } catch (error) {
-          console.error("Error sending KeepAlive:", error);
+          this.emit("keepalive:error", error);
         }
       }
-    }, this.keepAliveOptions.interval);
+    }, interval);
   }
 
   /**
-   * Stops automatic KeepAlive messages.
+   * Stop KeepAlive mechanism
    */
   private stopKeepAlive(): void {
     if (this.keepAliveTimer) {
@@ -158,115 +211,80 @@ export class ConnectionHealthManager extends EventEmitter {
   }
 
   /**
-   * Starts health monitoring with heartbeat checks.
+   * Start health checks
    */
-  private startHealthMonitor(): void {
-    this.stopHealthMonitor();
+  private startHealthChecks(): void {
+    if (!this.options.healthCheck.enabled || this.isPaused) return;
+
+    this.stopHealthChecks();
+
+    const { interval, degradedThreshold, unhealthyThreshold } = this.options.healthCheck;
 
     this.healthCheckTimer = setInterval(() => {
-      this.performHealthCheck();
-    }, this.healthMonitorOptions.heartbeatInterval);
+      const timeSinceActivity = Date.now() - this.activityTimestamp;
+      const status = this.getHealthStatus();
+
+      if (status.state === this.HealthState.UNHEALTHY) {
+        this.consecutiveHealthChecksFailed++;
+        this.emit("connection:unhealthy", {
+          timeSinceActivity,
+          consecutiveFailures: this.consecutiveHealthChecksFailed,
+        });
+
+        // Close socket if unhealthy threshold exceeded
+        if (this.consecutiveHealthChecksFailed >= this.options.healthCheck.maxUnhealthyChecks) {
+          this.emit("connection:timeout", {
+            timeSinceActivity,
+            threshold: unhealthyThreshold,
+          });
+          
+          if (this.socket) {
+            this.socket.close(1000, "Connection unhealthy - timed out");
+          }
+        }
+      } else if (status.state === this.HealthState.DEGRADED) {
+        this.emit("connection:degraded", {
+          timeSinceActivity,
+          threshold: degradedThreshold,
+        });
+      }
+    }, interval);
   }
 
   /**
-   * Stops health monitoring.
+   * Stop health checks
    */
-  private stopHealthMonitor(): void {
+  private stopHealthChecks(): void {
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = undefined;
     }
-
-    if (this.heartbeatTimeoutTimer) {
-      clearTimeout(this.heartbeatTimeoutTimer);
-      this.heartbeatTimeoutTimer = undefined;
-    }
   }
 
   /**
-   * Performs a health check by sending a heartbeat.
+   * Schedule reconnection attempt
    */
-  private performHealthCheck(): void {
-    this.heartbeatSequence++;
+  private scheduleReconnect(): void {
+    const { reconnect } = this.options;
 
-    const checkData = {
-      sequence: this.heartbeatSequence,
-      timestamp: Date.now(),
-    };
+    if (!reconnect.enabled) return;
 
-    this.emit("HeartbeatSent", checkData);
+    const delay = this.calculateReconnectDelay(this.reconnectAttempts);
 
-    // Set timeout to detect no response
-    if (this.heartbeatTimeoutTimer) {
-      clearTimeout(this.heartbeatTimeoutTimer);
-    }
-
-    this.heartbeatTimeoutTimer = setTimeout(() => {
-      this.handleHealthCheckTimeout(checkData);
-    }, this.healthMonitorOptions.heartbeatTimeout);
-  }
-
-  /**
-   * Handles health check timeout (no response received).
-   */
-  private handleHealthCheckTimeout(checkData: { sequence: number; timestamp: number }): void {
-    const timeSinceLastActivity = Date.now() - this.lastActivityTime;
-
-    this.emit("HealthCheckFailed", {
-      sequence: checkData.sequence,
-      timestamp: checkData.timestamp,
-      timeout: this.healthMonitorOptions.heartbeatTimeout,
-      lastActivity: this.lastActivityTime,
-      timeSinceLastActivity,
+    this.emit("reconnect:scheduled", {
+      attempt: this.reconnectAttempts + 1,
+      delay,
     });
 
-    // Silent disconnect detected - trigger reconnection if enabled
-    if (this.reconnectOptions.enabled && !this.isReconnecting) {
-      this.handleSilentDisconnect();
-    }
+    this.reconnectTimer = setTimeout(() => {
+      this.attemptReconnect();
+    }, delay);
   }
 
   /**
-   * Handles silent disconnect detection.
+   * Stop reconnection attempts
    */
-  private handleSilentDisconnect(): void {
-    this.log("warn", "Silent disconnect detected, closing connection");
-
-    // Close the connection if we can
-    if (this.disconnectFunction) {
-      try {
-        this.disconnectFunction(1000, "Silent disconnect detected");
-      } catch (error) {
-        console.error("Error disconnecting:", error);
-      }
-    }
-
-    // Start reconnection
-    this.startReconnection();
-  }
-
-  /**
-   * Starts automatic reconnection attempts.
-   */
-  private startReconnection(): void {
-    if (this.isReconnecting || !this.reconnectOptions.enabled) {
-      return;
-    }
-
-    this.isReconnecting = true;
-    this.reconnectAttemptCount = 0;
-    this.reconnectStartTime = Date.now();
-
-    this.scheduleReconnectAttempt();
-  }
-
-  /**
-   * Stops reconnection attempts.
-   */
-  private stopReconnection(): void {
-    this.isReconnecting = false;
-    this.reconnectAttemptCount = 0;
-
+  private stopReconnectAttempts(): void {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -274,150 +292,54 @@ export class ConnectionHealthManager extends EventEmitter {
   }
 
   /**
-   * Schedules the next reconnection attempt.
+   * Attempt to reconnect
    */
-  private scheduleReconnectAttempt(): void {
-    const delay = this.calculateBackoffDelay(this.reconnectAttemptCount);
+  private attemptReconnect(): void {
+    this.reconnectAttempts++;
 
-    this.emit("Reconnecting", {
-      attempt: this.reconnectAttemptCount + 1,
-      maxAttempts: this.reconnectOptions.maxAttempts,
-      delay,
+    this.emit("reconnect:attempting", {
+      attempt: this.reconnectAttempts,
     });
 
-    this.reconnectTimer = setTimeout(() => {
-      this.performReconnectAttempt();
-    }, delay);
-  }
-
-  /**
-   * Performs a reconnection attempt.
-   */
-  private performReconnectAttempt(): void {
-    this.reconnectAttemptCount++;
-
-    if (this.reconnectFunction) {
-      try {
-        this.reconnectFunction();
-      } catch (error) {
-        console.error("Error during reconnection attempt:", error);
-        this.handleReconnectFailed();
-        return;
-      }
-    }
-  }
-
-  /**
-   * Handles successful reconnection.
-   */
-  public handleReconnectSuccess(): void {
-    if (!this.isReconnecting) {
-      return;
-    }
-
-    const totalTime = this.reconnectStartTime ? Date.now() - this.reconnectStartTime : 0;
-
-    this.emit("Reconnected", {
-      attempt: this.reconnectAttemptCount,
-      totalTime,
-    });
-
-    this.stopReconnection();
-
-    // Reset health monitoring
-    this.lastActivityTime = Date.now();
-    this.heartbeatSequence = 0;
-
-    // Restart health management if it was running
-    if (this.isRunning) {
-      this.start();
-    }
-  }
-
-  /**
-   * Handles failed reconnection attempt.
-   */
-  private handleReconnectFailed(): void {
-    if (!this.isReconnecting) {
-      return;
-    }
-
-    if (this.reconnectAttemptCount >= this.reconnectOptions.maxAttempts) {
-      // Max attempts reached
-      const totalTime = this.reconnectStartTime ? Date.now() - this.reconnectStartTime : 0;
-
-      this.emit("MaxReconnectAttemptsReached", {
-        attempts: this.reconnectAttemptCount,
-        totalTime,
+    if (this.reconnectAttempts > this.options.reconnect.maxAttempts) {
+      this.emit("reconnect:failed", {
+        attempts: this.reconnectAttempts,
       });
-
-      this.stopReconnection();
-    } else {
-      // Schedule next attempt
-      this.scheduleReconnectAttempt();
+      return;
     }
+
+    // Emit event for the parent to handle actual reconnection
+    this.emit("reconnect", {
+      attempt: this.reconnectAttempts,
+    });
   }
 
   /**
-   * Calculates the delay before the next reconnection attempt based on the configured strategy.
+   * Calculate delay before next reconnection attempt using backoff strategy
    */
-  private calculateBackoffDelay(attemptCount: number): number {
-    const { backoffStrategy, initialDelay, maxDelay, stepDelay = 1000 } = this.reconnectOptions;
-
-    let delay: number;
+  private calculateReconnectDelay(attempt: number): number {
+    const { reconnect } = this.options;
+    const { initialDelay, maxDelay, backoffStrategy } = reconnect;
 
     switch (backoffStrategy) {
-      case BackoffStrategy.Exponential:
-        delay = initialDelay * Math.pow(2, attemptCount);
-        break;
-
-      case BackoffStrategy.Linear:
-        delay = initialDelay + attemptCount * stepDelay;
-        break;
-
-      case BackoffStrategy.Fixed:
+      case BackoffStrategy.EXPONENTIAL:
+        return Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
+      
+      case BackoffStrategy.LINEAR:
+        return Math.min(initialDelay * (attempt + 1), maxDelay);
+      
+      case BackoffStrategy.CONSTANT:
       default:
-        delay = initialDelay;
-        break;
-    }
-
-    // Cap at maxDelay
-    return Math.min(delay, maxDelay);
-  }
-
-  /**
-   * Records activity on the connection (message received/sent).
-   * This is used for health monitoring to determine if the connection is alive.
-   */
-  public recordActivity(): void {
-    this.lastActivityTime = Date.now();
-
-    // If we receive activity, clear any pending heartbeat timeout
-    if (this.heartbeatTimeoutTimer) {
-      clearTimeout(this.heartbeatTimeoutTimer);
-      this.heartbeatTimeoutTimer = undefined;
-
-      this.emit("HealthCheckPassed", {
-        timestamp: Date.now(),
-        lastActivity: this.lastActivityTime,
-      });
+        return initialDelay;
     }
   }
 
   /**
-   * Logs a message using the configured logger.
-   */
-  private log(kind: string, msg: string, data?: any): void {
-    if (this.keepAliveOptions.enabled || this.healthMonitorOptions.enabled) {
-      console.log(`[ConnectionHealthManager] ${kind}: ${msg}`, data || "");
-    }
-  }
-
-  /**
-   * Cleans up resources.
+   * Clean up resources
    */
   public destroy(): void {
     this.stop();
+    this.socket = null;
     this.removeAllListeners();
   }
 }
