@@ -5,17 +5,19 @@ import type { LiveSchema, LiveConfigOptions, DeepgramClientOptions } from "../li
 /**
  * The `ListenLiveClient` class extends the `AbstractLiveClient` class and provides functionality for setting up and managing a WebSocket connection for live transcription.
  *
- * The constructor takes in `DeepgramClientOptions` and an optional `LiveSchema` object, as well as an optional `endpoint` string. It then calls the `connect` method of the parent `AbstractLiveClient` class to establish the WebSocket connection.
+ * The constructor takes in `DeepgramClientOptions` and an optional `LiveSchema` object, as well as an optional `endpoint` string.
+ * By default, the `endpoint` is set to `/v1/listen`.
  *
- * The `setupConnection` method is responsible for handling the various events that can occur on the WebSocket connection, such as opening, closing, and receiving messages. It sets up event handlers for these events and emits the appropriate events based on the message type.
+ * @example
+ * const deepgram = new Deepgram(process.env.DEEPGRAM_API_KEY);
+ * const transcription = deepgram.transcription.live({ model: "nova-2", language: "en-US" });
  *
- * The `configure` method allows you to send additional configuration options to the connected session, such as enabling numerals.
+ * transcription.on(LiveTranscriptionEvents.Transcript, (result) => {
+ *   console.log(result);
+ * });
  *
- * The `keepAlive` method sends a "KeepAlive" message to the server to maintain the connection.
- *
- * The `requestClose` method requests the server to close the connection.
- *
- * The `finish` method is deprecated as of version 3.4 and will be removed in version 4.0. Use `requestClose` instead.
+ * // Note: In a real application, you would typically send audio data to the server using `transcription.send()`
+ * transcription.send("Hello, world!");
  */
 export class ListenLiveClient extends AbstractLiveClient {
   public namespace: string = "listen";
@@ -33,6 +35,9 @@ export class ListenLiveClient extends AbstractLiveClient {
     endpoint: string = ":version/listen"
   ) {
     super(options);
+
+    // Initialize health monitoring
+    this.initializeHealthMonitoring("listen");
 
     this.connect(transcriptionOptions, endpoint);
   }
@@ -56,6 +61,11 @@ export class ListenLiveClient extends AbstractLiveClient {
     // Set up message handling specific to transcription
     if (this.conn) {
       this.conn.onmessage = (event: MessageEvent) => {
+        // Record activity for health monitoring
+        if (this.connectionHealth) {
+          this.connectionHealth.recordActivity();
+        }
+
         try {
           const data: any = JSON.parse(event.data.toString());
 
@@ -139,6 +149,21 @@ export class ListenLiveClient extends AbstractLiveClient {
         type: "CloseStream",
       })
     );
+  }
+
+  /**
+   * Gets the namespace for this client.
+   * @returns The namespace (listen)
+   */
+  protected getNamespace(): string {
+    return "listen";
+  }
+
+  /**
+   * Sends a KeepAlive message for Listen connections.
+   */
+  protected sendKeepAliveMessage(): void {
+    this.keepAlive();
   }
 }
 

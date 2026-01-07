@@ -1,542 +1,479 @@
 import { AbstractClient, noop } from "./AbstractClient";
-import { CONNECTION_STATE, SOCKET_STATES } from "../lib/constants";
+import { CONNECTION_STATE, CONNECTION_EVENT, SOCKET_STATES } from "../lib/constants";
 import type { DeepgramClientOptions, LiveSchema } from "../lib/types";
 import type { WebSocket as WSWebSocket } from "ws";
 import { isBun } from "../lib/runtime";
 import { DeepgramWebSocketError } from "../lib/errors";
+import { ConnectionHealthManager } from "../lib/ConnectionHealthManager";
+import { ConnectionHealthOptions } from "../lib/types/ConnectionHealthOptions";
+import { LiveConnectionHealthEvents } from "../lib/enums/LiveConnectionHealthEvents";
+import { LiveConnectionState } from "../lib/enums/LiveConnectionState";
 
 /**
  * Represents a constructor for a WebSocket-like object that can be used in the application.
- * The constructor takes the following parameters:
- * @param address - The URL or address of the WebSocket server.
- * @param _ignored - An optional parameter that is ignored.
- * @param options - An optional object containing headers to be included in the WebSocket connection.
- * @returns A WebSocket-like object that implements the WebSocketLike interface.
  */
-interface WebSocketLikeConstructor {
-  new(
-    address: string | URL,
-    _ignored?: any,
-    options?: { headers: object | undefined }
-  ): WebSocketLike;
-}
+export type WebSocketConstructor = (url: string, protocols?: string | string[]) => WebSocket;
 
 /**
- * Represents the types of WebSocket-like connections that can be used in the application.
- * This type is used to provide a common interface for different WebSocket implementations,
- * such as the native WebSocket API, a WebSocket wrapper library, or a dummy implementation
- * for testing purposes.
- */
-type WebSocketLike = WebSocket | WSWebSocket | WSWebSocketDummy;
-
-/**
- * Represents the types of data that can be sent or received over a WebSocket-like connection.
- */
-type SocketDataLike = string | ArrayBufferLike | Blob;
-
-/**
- * Represents an error that occurred in a WebSocket-like connection.
- * @property {any} error - The underlying error object.
- * @property {string} message - A human-readable error message.
- * @property {string} type - The type of the error.
- */
-// interface WebSocketLikeError {
-//   error: any;
-//   message: string;
-//   type: string;
-// }
-
-/**
- * Indicates whether a native WebSocket implementation is available in the current environment.
- */
-const NATIVE_WEBSOCKET_AVAILABLE = typeof WebSocket !== "undefined";
-
-/**
- * Represents an abstract live client that extends the AbstractClient class.
- * The AbstractLiveClient class provides functionality for connecting, reconnecting, and disconnecting a WebSocket connection, as well as sending data over the connection.
- * Subclasses of this class are responsible for setting up the connection event handlers.
+ * Abstract base class for live WebSocket-based clients.
+ * Provides common functionality for managing WebSocket connections with health monitoring.
  *
- * @abstract
+ * @example
+ * ```typescript
+ * class MyLiveClient extends AbstractLiveClient {
+ *   constructor(options: DeepgramClientOptions) {
+ *     super(options);
+ *     this.connect({}, "/my/endpoint");
+ *   }
+ * }
+ * ```
  */
 export abstract class AbstractLiveClient extends AbstractClient {
-  public headers: { [key: string]: string };
-  public transport: WebSocketLikeConstructor | null;
-  public conn: WebSocketLike | null = null;
-  public sendBuffer: Function[] = [];
+  /**
+   * Event emitter for connection events.
+   */
+  events: Record<string, (...args: any[]) => void>;
 
+  /**
+   * The WebSocket connection instance.
+   */
+  conn?: WebSocket;
+
+  /**
+   * The URL to connect to.
+   */
+  baseUrl: string;
+
+  /**
+   * The endpoint path to connect to.
+   */
+  endpoint: string;
+
+  /**
+   * Schema/options for the connection.
+   */
+  schema: LiveSchema = {};
+
+  /**
+   * Connection health manager for monitoring and maintaining the connection.
+   */
+  connectionHealth?: ConnectionHealthManager;
+
+  /**
+   * Default transcription URL.
+   */
+  DEFAULT_TRANSCRIPTION_URL: string = "wss://api.deepgram.com/v1/listen";
+
+  /**
+   * Default speak URL.
+   */
+  DEFAULT_SPEAK_URL: string = "wss://api.deepgram.com/v1/speak";
+
+  /**
+   * Default agent URL.
+   */
+  DEFAULT_AGENT_URL: string = "wss://api.deepgram.com/v1/agent/converse";
+
+  /**
+   * Creates a new AbstractLiveClient instance.
+   *
+   * @param options - Deepgram client options
+   */
   constructor(options: DeepgramClientOptions) {
     super(options);
 
-    const {
-      key,
-      websocket: { options: websocketOptions, client },
-    } = this.namespaceOptions;
-
-    if (this.proxy) {
-      this.baseUrl = websocketOptions.proxy!.url;
-    } else {
-      this.baseUrl = websocketOptions.url;
-    }
-
-    if (client) {
-      this.transport = client;
-    } else {
-      this.transport = null;
-    }
-
-    if (websocketOptions._nodeOnlyHeaders) {
-      this.headers = websocketOptions._nodeOnlyHeaders;
-    } else {
-      this.headers = {};
-    }
-
-    if (!("Authorization" in this.headers)) {
-      if (this.accessToken) {
-        this.headers["Authorization"] = `Bearer ${this.accessToken}`; // Use token if available
-      } else {
-        this.headers["Authorization"] = `Token ${key}`; // Add default token
-      }
-    }
-  }
-
-  /**
-   * Connects the socket, unless already connected.
-   *
-   * @protected Can only be called from within the class.
-   */
-  protected connect(transcriptionOptions: LiveSchema, endpoint: string): void {
-    if (this.conn) {
-      return;
-    }
-
-    this.reconnect = (options = transcriptionOptions) => {
-      this.connect(options, endpoint);
-    };
-
-    const requestUrl = this.getRequestUrl(endpoint, {}, transcriptionOptions);
-    const accessToken = this.accessToken;
-    const apiKey = this.key;
-
-    if (!accessToken && !apiKey) {
-      throw new Error("No key or access token provided for WebSocket connection.");
-    }
-
-    /**
-     * Custom websocket transport
-     */
-    if (this.transport) {
-      this.conn = new this.transport(requestUrl, undefined, {
-        headers: this.headers,
-      });
-      this.setupConnection();
-      return;
-    }
-
-    /**
-     * @summary Bun websocket transport has a bug where it's native WebSocket implementation messes up the headers
-     * @summary This is a workaround to use the WS package for the websocket connection instead of the native Bun WebSocket
-     * @summary you can track the issue here
-     * @link https://github.com/oven-sh/bun/issues/4529
-     */
-    if (isBun()) {
-      import("ws").then(({ default: WS }) => {
-        this.conn = new WS(requestUrl, {
-          headers: this.headers,
-        });
-        console.log(`Using WS package`);
-        this.setupConnection();
-      });
-      return;
-    }
-
-    /**
-     * Native websocket transport (browser)
-     */
-    if (NATIVE_WEBSOCKET_AVAILABLE) {
-      this.conn = new WebSocket(
-        requestUrl,
-        accessToken ? ["bearer", accessToken] : ["token", apiKey!]
-      );
-      this.setupConnection();
-      return;
-    }
-
-    /**
-     * Dummy websocket
-     */
-    this.conn = new WSWebSocketDummy(requestUrl, undefined, {
-      close: () => {
-        this.conn = null;
-      },
-    });
-
-    /**
-     * WS package for node environment
-     */
-    import("ws").then(({ default: WS }) => {
-      this.conn = new WS(requestUrl, undefined, {
-        headers: this.headers,
-      });
-      this.setupConnection();
-    });
-  }
-
-  /**
-   * Reconnects the socket using new or existing transcription options.
-   *
-   * @param options - The transcription options to use when reconnecting the socket.
-   */
-  public reconnect: (options: LiveSchema) => void = noop;
-
-  /**
-   * Disconnects the socket from the client.
-   *
-   * @param code A numeric status code to send on disconnect.
-   * @param reason A custom reason for the disconnect.
-   */
-  public disconnect(code?: number, reason?: string): void {
-    if (this.conn) {
-      this.conn.onclose = function () { }; // noop
-      if (code) {
-        this.conn.close(code, reason ?? "");
-      } else {
-        this.conn.close();
-      }
-      this.conn = null;
-    }
-  }
-
-  /**
-   * Returns the current connection state of the WebSocket connection.
-   *
-   * @returns The current connection state of the WebSocket connection.
-   */
-  public connectionState(): CONNECTION_STATE {
-    switch (this.conn && this.conn.readyState) {
-      case SOCKET_STATES.connecting:
-        return CONNECTION_STATE.Connecting;
-      case SOCKET_STATES.open:
-        return CONNECTION_STATE.Open;
-      case SOCKET_STATES.closing:
-        return CONNECTION_STATE.Closing;
-      default:
-        return CONNECTION_STATE.Closed;
-    }
-  }
-
-  /**
-   * Returns the current ready state of the WebSocket connection.
-   *
-   * @returns The current ready state of the WebSocket connection.
-   */
-  public getReadyState(): SOCKET_STATES {
-    return this.conn?.readyState ?? SOCKET_STATES.closed;
-  }
-
-  /**
-   * Returns `true` is the connection is open.
-   */
-  public isConnected(): boolean {
-    return this.connectionState() === CONNECTION_STATE.Open;
-  }
-
-  /**
-   * Sends data to the Deepgram API via websocket connection
-   * @param data Audio data to send to Deepgram
-   *
-   * Conforms to RFC #146 for Node.js - does not send an empty byte.
-   * @see https://github.com/deepgram/deepgram-python-sdk/issues/146
-   */
-  send(data: SocketDataLike): void {
-    const callback = async () => {
-      if (data instanceof Blob) {
-        if (data.size === 0) {
-          this.log("warn", "skipping `send` for zero-byte blob", data);
-
-          return;
-        }
-
-        data = await data.arrayBuffer();
-      }
-
-      if (typeof data !== "string") {
-        if (!data?.byteLength) {
-          this.log("warn", "skipping `send` for zero-byte payload", data);
-
-          return;
-        }
-      }
-
-      this.conn?.send(data);
-    };
-
-    if (this.isConnected()) {
-      callback();
-    } else {
-      this.sendBuffer.push(callback);
-    }
-  }
-
-  /**
-   * Determines whether the current instance should proxy requests.
-   * @returns {boolean} true if the current instance should proxy requests; otherwise, false
-   */
-  get proxy(): boolean {
-    return this.key === "proxy" && !!this.namespaceOptions.websocket.options.proxy?.url;
-  }
-
-  /**
-   * Extracts enhanced error information from a WebSocket error event.
-   * This method attempts to capture additional debugging information such as
-   * status codes, request IDs, and response headers when available.
-   *
-   * @example
-   * ```typescript
-   * // Enhanced error information is now available in error events:
-   * connection.on(LiveTranscriptionEvents.Error, (err) => {
-   *   console.error("WebSocket Error:", err.message);
-   *
-   *   // Access HTTP status code (e.g., 502, 403, etc.)
-   *   if (err.statusCode) {
-   *     console.error(`HTTP Status Code: ${err.statusCode}`);
-   *   }
-   *
-   *   // Access Deepgram request ID for support tickets
-   *   if (err.requestId) {
-   *     console.error(`Deepgram Request ID: ${err.requestId}`);
-   *   }
-   *
-   *   // Access WebSocket URL and connection state
-   *   if (err.url) {
-   *     console.error(`WebSocket URL: ${err.url}`);
-   *   }
-   *
-   *   if (err.readyState !== undefined) {
-   *     const stateNames = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
-   *     console.error(`Connection State: ${stateNames[err.readyState]}`);
-   *   }
-   *
-   *   // Access response headers for additional debugging
-   *   if (err.responseHeaders) {
-   *     console.error("Response Headers:", err.responseHeaders);
-   *   }
-   *
-   *   // Access the enhanced error object for detailed debugging
-   *   if (err.error?.name === 'DeepgramWebSocketError') {
-   *     console.error("Enhanced Error Details:", err.error.toJSON());
-   *   }
-   * });
-   * ```
-   *
-   * @param event - The error event from the WebSocket
-   * @param conn - The WebSocket connection object
-   * @returns Enhanced error information object
-   */
-  protected extractErrorInformation(
-    event: ErrorEvent | Event,
-    conn?: WebSocketLike
-  ): {
-    statusCode?: number;
-    requestId?: string;
-    responseHeaders?: Record<string, string>;
-    url?: string;
-    readyState?: number;
-  } {
-    const errorInfo: {
-      statusCode?: number;
-      requestId?: string;
-      responseHeaders?: Record<string, string>;
-      url?: string;
-      readyState?: number;
-    } = {};
-
-    // Extract basic connection information
-    if (conn) {
-      errorInfo.readyState = conn.readyState;
-      errorInfo.url = typeof conn.url === "string" ? conn.url : conn.url?.toString();
-    }
-
-    // Try to extract additional information from the WebSocket connection
-    // This works with the 'ws' package which exposes more detailed error information
-    if (conn && typeof conn === "object") {
-      const wsConn = conn as any;
-
-      // Extract status code if available (from 'ws' package)
-      if (wsConn._req && wsConn._req.res) {
-        errorInfo.statusCode = wsConn._req.res.statusCode;
-
-        // Extract response headers if available
-        if (wsConn._req.res.headers) {
-          errorInfo.responseHeaders = { ...wsConn._req.res.headers };
-
-          // Extract request ID from Deepgram response headers
-          const requestId =
-            wsConn._req.res.headers["dg-request-id"] || wsConn._req.res.headers["x-dg-request-id"];
-          if (requestId) {
-            errorInfo.requestId = requestId;
-          }
-        }
-      }
-
-      // For native WebSocket, try to extract information from the event
-      if (event && "target" in event && event.target) {
-        const target = event.target as any;
-        if (target.url) {
-          errorInfo.url = target.url;
-        }
-        if (target.readyState !== undefined) {
-          errorInfo.readyState = target.readyState;
-        }
-      }
-    }
-
-    return errorInfo;
-  }
-
-  /**
-   * Creates an enhanced error object with additional debugging information.
-   * This method provides backward compatibility by including both the original
-   * error event and enhanced error information.
-   *
-   * @param event - The original error event
-   * @param enhancedInfo - Additional error information extracted from the connection
-   * @returns An object containing both original and enhanced error information
-   */
-  protected createEnhancedError(
-    event: ErrorEvent | Event,
-    enhancedInfo: {
-      statusCode?: number;
-      requestId?: string;
-      responseHeaders?: Record<string, string>;
-      url?: string;
-      readyState?: number;
-    }
-  ) {
-    // Create the enhanced error for detailed debugging
-    const enhancedError = new DeepgramWebSocketError(
-      (event as ErrorEvent).message || "WebSocket connection error",
-      {
-        originalEvent: event,
-        ...enhancedInfo,
-      }
-    );
-
-    // Return an object that maintains backward compatibility
-    // while providing enhanced information
-    return {
-      // Original event for backward compatibility
-      ...event,
-      // Enhanced error information
-      error: enhancedError,
-      // Additional fields for easier access
-      statusCode: enhancedInfo.statusCode,
-      requestId: enhancedInfo.requestId,
-      responseHeaders: enhancedInfo.responseHeaders,
-      url: enhancedInfo.url,
-      readyState: enhancedInfo.readyState,
-      // Enhanced message with more context
-      message: this.buildEnhancedErrorMessage(event, enhancedInfo),
-    };
-  }
-
-  /**
-   * Builds an enhanced error message with additional context information.
-   *
-   * @param event - The original error event
-   * @param enhancedInfo - Additional error information
-   * @returns A more descriptive error message
-   */
-  protected buildEnhancedErrorMessage(
-    event: ErrorEvent | Event,
-    enhancedInfo: {
-      statusCode?: number;
-      requestId?: string;
-      responseHeaders?: Record<string, string>;
-      url?: string;
-      readyState?: number;
-    }
-  ): string {
-    let message = (event as ErrorEvent).message || "WebSocket connection error";
-
-    const details: string[] = [];
-
-    if (enhancedInfo.statusCode) {
-      details.push(`Status: ${enhancedInfo.statusCode}`);
-    }
-
-    if (enhancedInfo.requestId) {
-      details.push(`Request ID: ${enhancedInfo.requestId}`);
-    }
-
-    if (enhancedInfo.readyState !== undefined) {
-      const stateNames = ["CONNECTING", "OPEN", "CLOSING", "CLOSED"];
-      const stateName =
-        stateNames[enhancedInfo.readyState] || `Unknown(${enhancedInfo.readyState})`;
-      details.push(`Ready State: ${stateName}`);
-    }
-
-    if (enhancedInfo.url) {
-      details.push(`URL: ${enhancedInfo.url}`);
-    }
-
-    if (details.length > 0) {
-      message += ` (${details.join(", ")})`;
-    }
-
-    return message;
-  }
-
-  /**
-   * Sets up the standard connection event handlers (open, close, error) for WebSocket connections.
-   * This method abstracts the common connection event registration pattern used across all live clients.
-   *
-   * @param events - Object containing the event constants for the specific client type
-   * @param events.Open - Event constant for connection open
-   * @param events.Close - Event constant for connection close
-   * @param events.Error - Event constant for connection error
-   * @protected
-   */
-  protected setupConnectionEvents(events: { Open: string; Close: string; Error: string }): void {
-    if (this.conn) {
-      this.conn.onopen = () => {
-        this.emit(events.Open, this);
-      };
-
-      this.conn.onclose = (event: any) => {
-        this.emit(events.Close, event);
-      };
-
-      this.conn.onerror = (event: ErrorEvent) => {
-        const enhancedInfo = this.extractErrorInformation(event, this.conn || undefined);
-        const enhancedError = this.createEnhancedError(event, enhancedInfo);
-        this.emit(events.Error, enhancedError);
-      };
-    }
+    this.events = {};
+    this.baseUrl = options.url || this.DEFAULT_TRANSCRIPTION_URL;
+    this.endpoint = "";
   }
 
   /**
    * Sets up the connection event handlers.
    *
-   * @abstract Requires subclasses to set up context aware event handlers.
+   * @param eventMap - Mapping of connection events to emitted events
    */
-  abstract setupConnection(): void;
-}
+  protected setupConnectionEvents(eventMap: {
+    Open: string;
+    Close: string;
+    Error: string;
+  }): void {
+    if (!this.conn) {
+      return;
+    }
 
-class WSWebSocketDummy {
-  binaryType: string = "arraybuffer";
-  close: Function;
-  onclose: Function = () => { };
-  onerror: Function = () => { };
-  onmessage: Function = () => { };
-  onopen: Function = () => { };
-  readyState: number = SOCKET_STATES.connecting;
-  send: Function = () => { };
-  url: string | URL | null = null;
+    // Handle connection open
+    this.conn.onopen = () => {
+      this.emit(eventMap.Open, this);
+      this.log("Connection opened");
+      this._setConnectionState(CONNECTION_STATE.OPEN);
 
-  constructor(address: URL, _protocols: undefined, options: { close: Function }) {
-    this.url = address.toString();
-    this.close = options.close;
+      // Start health monitoring on successful connection
+      if (this.connectionHealth) {
+        this.connectionHealth.handleReconnectSuccess();
+      }
+    };
+
+    // Handle connection close
+    this.conn.onclose = (event) => {
+      this.emit(eventMap.Close, event);
+      this.log("Connection closed", event);
+      this._setConnectionState(CONNECTION_STATE.CLOSED);
+
+      // Stop health monitoring on close
+      if (this.connectionHealth) {
+        this.connectionHealth.stop();
+      }
+
+      // Attempt reconnection if enabled
+      if (this.connectionHealth && this.options.connectionHealth?.reconnect?.enabled) {
+        this.connectionHealth.startReconnection();
+      }
+    };
+
+    // Handle connection errors
+    this.conn.onerror = (event) => {
+      this.emit(eventMap.Error, event);
+      this.log("Connection error", event);
+      this._setConnectionState(CONNECTION_STATE.ERROR);
+
+      // Notify health manager of error
+      if (this.connectionHealth) {
+        this.emit(LiveConnectionHealthEvents.Error, {
+          type: "ConnectionError",
+          event,
+        });
+      }
+    };
   }
-}
 
-export { AbstractLiveClient as AbstractWsClient };
+  /**
+   * Initializes connection health monitoring based on options.
+   *
+   * @param namespace - The namespace (listen, speak, agent) for default KeepAlive interval
+   */
+  protected initializeHealthMonitoring(namespace: string): void {
+    const healthOptions = this.getHealthOptions(namespace);
+
+    if (!healthOptions) {
+      return;
+    }
+
+    const defaultKeepAliveInterval = this.getDefaultKeepAliveInterval();
+    this.connectionHealth = new ConnectionHealthManager(
+      healthOptions,
+      defaultKeepAliveInterval
+    );
+
+    // Set up health manager callbacks
+    this.connectionHealth.setKeepAliveFunction(() => this.sendKeepAliveMessage());
+    this.connectionHealth.setReconnectFunction(() => this.reconnect());
+    this.connectionHealth.setDisconnectFunction((code, reason) =>
+      this.disconnect(code, reason)
+    );
+
+    // Set up health event listeners
+    this.setupHealthEventListeners();
+
+    this.log("Health monitoring initialized for namespace:", namespace);
+  }
+
+  /**
+   * Gets the health monitoring options from client configuration.
+   *
+   * @param namespace - The namespace (listen, speak, agent)
+   * @returns The health options, or undefined if not configured
+   */
+  private getHealthOptions(namespace: string): ConnectionHealthOptions | undefined {
+    const namespaceKey = namespace.toLowerCase() as keyof DeepgramClientOptions;
+    const namespaceOptions = this.options[namespaceKey];
+
+    if (namespaceOptions?.connectionHealth) {
+      return namespaceOptions.connectionHealth;
+    }
+
+    return this.options.connectionHealth;
+  }
+
+  /**
+   * Sets up event listeners for health monitoring events.
+   */
+  private setupHealthEventListeners(): void {
+    if (!this.connectionHealth) {
+      return;
+    }
+
+    // Forward all health events
+    Object.values(LiveConnectionHealthEvents).forEach((eventName) => {
+      this.connectionHealth?.on(eventName, (...args: any[]) => {
+        this.emit(eventName, ...args);
+      });
+    });
+  }
+
+  /**
+   * Gets the default KeepAlive interval for the connection type.
+   * Should be overridden by subclasses to provide namespace-specific intervals.
+   *
+   * @returns Default KeepAlive interval in milliseconds
+   */
+  protected getDefaultKeepAliveInterval(): number {
+    return 10000; // Default 10 seconds
+  }
+
+  /**
+   * Sends a KeepAlive message to the server.
+   * Should be overridden by subclasses to send the appropriate message format.
+   */
+  protected sendKeepAliveMessage(): void {
+    this.send(JSON.stringify({ type: "KeepAlive" }));
+  }
+
+  /**
+   * Reconnects to the server using the same schema/options.
+   */
+  protected reconnect(): void {
+    this.log("Reconnecting...");
+
+    // Close existing connection
+    if (this.conn) {
+      this.conn.close(1000, "Reconnecting");
+    }
+
+    // Reconnect with the same schema
+    this.connect(this.schema, this.endpoint);
+  }
+
+  /**
+   * Disconnects from the server.
+   *
+   * @param code - WebSocket close code
+   * @param reason - Close reason
+   */
+  protected disconnect(code?: number, reason?: string): void {
+    this.log("Disconnecting:", reason);
+
+    // Stop health monitoring
+    if (this.connectionHealth) {
+      this.connectionHealth.stop();
+    }
+
+    // Close connection
+    if (this.conn) {
+      this.conn.close(code, reason);
+    }
+  }
+
+  /**
+   * Connects to the WebSocket endpoint.
+   *
+   * @param schema - Schema/options for the connection
+   * @param endpoint - The endpoint path
+   */
+  connect(schema: LiveSchema, endpoint: string): void {
+    this.schema = schema;
+    this.endpoint = endpoint;
+
+    const url = this.buildUrl(schema, endpoint);
+    this.log("Connecting to", url);
+
+    this._setConnectionState(CONNECTION_STATE.CONNECTING);
+
+    const websocketOptions = this.getWebsocketOptions();
+    const protocols = this.getProtocols();
+
+    try {
+      this.conn = new (isBun ? WebSocket : (window as any).WebSocket)(
+        url,
+        protocols,
+        websocketOptions
+      );
+
+      this.setupConnection();
+    } catch (error) {
+      this.log("Error creating WebSocket:", error);
+      this._setConnectionState(CONNECTION_STATE.ERROR);
+      this.emit(CONNECTION_EVENT.ERROR, error);
+      throw new DeepgramWebSocketError(
+        "Failed to create WebSocket connection",
+        error as Error
+      );
+    }
+  }
+
+  /**
+   * Sets up the connection. Should be overridden by subclasses.
+   */
+  protected abstract setupConnection(): void;
+
+  /**
+   * Builds the WebSocket URL.
+   *
+   * @param schema - Schema/options for the connection
+   * @param endpoint - The endpoint path
+   * @returns The complete WebSocket URL
+   */
+  protected buildUrl(schema: LiveSchema, endpoint: string): string {
+    let url = this.baseUrl + endpoint;
+
+    const params = new URLSearchParams();
+
+    // Add schema parameters
+    for (const [key, value] of Object.entries(schema)) {
+      if (value !== undefined && value !== null) {
+        if (typeof value === "object") {
+          params.set(key, JSON.stringify(value));
+        } else {
+          params.set(key, String(value));
+        }
+      }
+    }
+
+    const paramString = params.toString();
+    if (paramString) {
+      url += `?${paramString}`;
+    }
+
+    return url;
+  }
+
+  /**
+   * Gets WebSocket options from client configuration.
+   *
+   * @returns WebSocket options
+   */
+  protected getWebsocketOptions(): any {
+    const namespace = this.getNamespace();
+    const namespaceOptions = this.options[
+      namespace.toLowerCase() as keyof DeepgramClientOptions
+    ];
+
+    if (namespaceOptions?.websocket?.options) {
+      return namespaceOptions.websocket.options;
+    }
+
+    return this.options.websocket?.options;
+  }
+
+  /**
+   * Gets the namespace for this client.
+   * Should be overridden by subclasses.
+   *
+   * @returns The namespace (listen, speak, agent)
+   */
+  protected abstract getNamespace(): string;
+
+  /**
+   * Gets the WebSocket protocols.
+   *
+   * @returns WebSocket protocols
+   */
+  protected getProtocols(): string | string[] | undefined {
+    return undefined;
+  }
+
+  /**
+   * Sends data through the WebSocket connection.
+   *
+   * @param data - The data to send
+   */
+  send(data: string): void {
+    if (!this.conn) {
+      this.log("Error: No connection");
+      this.emit(CONNECTION_EVENT.ERROR, new Error("No connection"));
+      return;
+    }
+
+    if (this.conn.readyState !== SOCKET_STATES.OPEN) {
+      this.log("Error: Connection not ready", this.conn.readyState);
+      this.emit(
+        CONNECTION_EVENT.ERROR,
+        new Error(`Connection not ready (state: ${this.conn.readyState})`)
+      );
+      return;
+    }
+
+    this.conn.send(data);
+  }
+
+  /**
+   * Registers an event listener.
+   *
+   * @param event - The event name
+   * @param callback - The callback function
+   */
+  on(event: string, callback: (...args: any[]) => void): void {
+    if (!this.events[event]) {
+      this.events[event] = noop;
+    }
+
+    this.events[event] = callback;
+  }
+
+  /**
+   * Removes an event listener.
+   *
+   * @param event - The event name
+   */
+  off(event: string): void {
+    if (this.events[event]) {
+      this.events[event] = noop;
+    }
+  }
+
+  /**
+   * Emits an event to all registered listeners.
+   *
+   * @param event - The event name
+   * @param args - Event arguments
+   */
+  emit(event: string, ...args: any[]): void {
+    if (this.events[event]) {
+      this.events[event](...args);
+    }
+  }
+
+  /**
+   * Closes the WebSocket connection.
+   *
+   * @param code - WebSocket close code
+   * @param reason - Close reason
+   */
+  close(code?: number, reason?: string): void {
+    this.log("Closing connection");
+
+    // Stop health monitoring
+    if (this.connectionHealth) {
+      this.connectionHealth.destroy();
+    }
+
+    if (this.conn) {
+      this.conn.close(code, reason);
+    }
+  }
+
+  /**
+   * Logs a message to the console.
+   *
+   * @param args - Arguments to log
+   */
+  protected log(...args: any[]): void {
+    if (this.options.debug) {
+      console.log(`[AbstractLiveClient]`, ...args);
+    }
+  }
+
+  /**
+   * Sets the connection state.
+   *
+   * @param state - The connection state
+   */
+  private _setConnectionState(state: CONNECTION_STATE): void {
+    this.connectionState = state;
+    this.emit(LiveConnectionState[state], state);
+  }
+
+  /**
+   * The current connection state.
+   */
+  protected connectionState: CONNECTION_STATE = CONNECTION_STATE.CLOSED;
+}

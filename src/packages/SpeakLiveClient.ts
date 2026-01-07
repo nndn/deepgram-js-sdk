@@ -5,13 +5,21 @@ import type { SpeakSchema, DeepgramClientOptions } from "../lib/types";
 /**
  * The `SpeakLiveClient` class extends the `AbstractLiveClient` class and provides functionality for setting up and managing a WebSocket connection for live text-to-speech synthesis.
  *
- * The constructor takes in `DeepgramClientOptions` and an optional `SpeakSchema` object, as well as an optional `endpoint` string. It then calls the `connect` method of the parent `AbstractLiveClient` class to establish the WebSocket connection.
+ * The constructor takes in `DeepgramClientOptions` and an optional `SpeakSchema` object, as well as an optional `endpoint` string.
+ * By default, the `endpoint` is set to `/v1/speak`.
  *
- * The `setupConnection` method is responsible for handling the various events that can occur on the WebSocket connection, such as opening, closing, and receiving messages. It sets up event handlers for these events and emits the appropriate events based on the message type.
+ * @example
+ * const deepgram = new Deepgram(process.env.DEEPGRAM_API_KEY);
+ * const tts = deepgram.speak.live({ model: "aura-asteria-en" });
  *
- * The `configure` method allows you to send additional configuration options to the connected session.
+ * tts.on(LiveTTSEvents.Open, () => {
+ *   tts.send("Hello, world!");
+ * });
  *
- * The `requestClose` method requests the server to close the connection.
+ * tts.on(LiveTTSEvents.Audio, (result) => {
+ *   const buffer = Buffer.from(result.data, "base64");
+ *   // Process audio buffer
+ * });
  */
 export class SpeakLiveClient extends AbstractLiveClient {
   public namespace: string = "speak";
@@ -29,6 +37,9 @@ export class SpeakLiveClient extends AbstractLiveClient {
     endpoint: string = ":version/speak"
   ) {
     super(options);
+
+    // Initialize health monitoring
+    this.initializeHealthMonitoring("speak");
 
     this.connect(speakOptions, endpoint);
   }
@@ -82,6 +93,52 @@ export class SpeakLiveClient extends AbstractLiveClient {
   }
 
   /**
+   * Handles incoming messages from the WebSocket connection.
+   * @param event - The MessageEvent object representing the received message.
+   */
+  protected handleMessage(event: MessageEvent): void {
+    // Record activity for health monitoring
+    if (this.connectionHealth) {
+      this.connectionHealth.recordActivity();
+    }
+
+    if (typeof event.data === "string") {
+      try {
+        const data = JSON.parse(event.data);
+        this.handleTextMessage(data);
+      } catch (error) {
+        this.emit(LiveTTSEvents.Error, {
+          event,
+          message: "Unable to parse `data` as JSON.",
+          error,
+          url: this.conn?.url,
+          readyState: this.conn?.readyState,
+          data:
+            event.data?.toString().substring(0, 200) +
+            (event.data?.toString().length > 200 ? "..." : ""),
+        });
+      }
+    } else if (event.data instanceof Blob) {
+      event.data.arrayBuffer().then((buffer) => {
+        this.handleBinaryMessage(Buffer.from(buffer));
+      });
+    } else if (event.data instanceof ArrayBuffer) {
+      this.handleBinaryMessage(Buffer.from(event.data));
+    } else if (Buffer.isBuffer(event.data)) {
+      this.handleBinaryMessage(event.data);
+    } else {
+      console.log("Received unknown data type", event.data);
+      this.emit(LiveTTSEvents.Error, {
+        event,
+        message: "Received unknown data type.",
+        url: this.conn?.url,
+        readyState: this.conn?.readyState,
+        dataType: typeof event.data,
+      });
+    }
+  }
+
+  /**
    * Sends a text input message to the server.
    *
    * @param {string} text - The text to convert to speech.
@@ -129,43 +186,17 @@ export class SpeakLiveClient extends AbstractLiveClient {
   }
 
   /**
-   * Handles incoming messages from the WebSocket connection.
-   * @param event - The MessageEvent object representing the received message.
+   * Gets the namespace for this client.
+   * @returns The namespace (speak)
    */
-  protected handleMessage(event: MessageEvent): void {
-    if (typeof event.data === "string") {
-      try {
-        const data = JSON.parse(event.data);
-        this.handleTextMessage(data);
-      } catch (error) {
-        this.emit(LiveTTSEvents.Error, {
-          event,
-          message: "Unable to parse `data` as JSON.",
-          error,
-          url: this.conn?.url,
-          readyState: this.conn?.readyState,
-          data:
-            event.data?.toString().substring(0, 200) +
-            (event.data?.toString().length > 200 ? "..." : ""),
-        });
-      }
-    } else if (event.data instanceof Blob) {
-      event.data.arrayBuffer().then((buffer) => {
-        this.handleBinaryMessage(Buffer.from(buffer));
-      });
-    } else if (event.data instanceof ArrayBuffer) {
-      this.handleBinaryMessage(Buffer.from(event.data));
-    } else if (Buffer.isBuffer(event.data)) {
-      this.handleBinaryMessage(event.data);
-    } else {
-      console.log("Received unknown data type", event.data);
-      this.emit(LiveTTSEvents.Error, {
-        event,
-        message: "Received unknown data type.",
-        url: this.conn?.url,
-        readyState: this.conn?.readyState,
-        dataType: typeof event.data,
-      });
-    }
+  protected getNamespace(): string {
+    return "speak";
+  }
+
+  /**
+   * Sends a KeepAlive message for Speak connections.
+   */
+  protected sendKeepAliveMessage(): void {
+    this.send(JSON.stringify({ type: "KeepAlive" }));
   }
 }

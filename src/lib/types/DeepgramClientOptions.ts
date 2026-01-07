@@ -1,4 +1,5 @@
 import { Fetch, FetchOptions } from "./Fetch";
+import { ConnectionHealthOptions } from "./ConnectionHealthOptions";
 
 export type IKeyFactory = () => string;
 export type IFetch = typeof fetch;
@@ -39,6 +40,7 @@ export interface NamespaceOptions {
   accessToken?: string | IKeyFactory;
   fetch?: ITransport<IFetch, TransportFetchOptions>;
   websocket?: ITransport<IWebSocket, TransportWebSocketOptions>;
+  connectionHealth?: ConnectionHealthOptions;
 }
 
 export type DefaultClientOptions = {
@@ -46,9 +48,9 @@ export type DefaultClientOptions = {
 } & DeepgramClientOptions;
 
 /**
- * Configures the options for a Deepgram client.
+ * Configures options for a Deepgram client.
  *
- * The `DeepgramClientOptions` interface defines the configuration options for a Deepgram client. It includes options for various namespaces, such as `global`, `listen`, `manage`, `onprem`, `read`, and `speak`. Each namespace has its own options for configuring the transport, including the URL, proxy, and options for the fetch and WebSocket clients.
+ * The `DeepgramClientOptions` interface defines the configuration options for a Deepgram client. It includes options for various namespaces, such as `global`, `listen`, `manage`, `onprem`, `read`, and `speak`. Each namespace has its own options for configuring the transport, including the URL, proxy, and options for fetch and WebSocket clients.
  *
  * The `global` namespace is used to configure options that apply globally to the Deepgram client. The other namespaces are used to configure options specific to different Deepgram API endpoints.
  * Support introductory formats:

@@ -10,6 +10,9 @@ export class AgentLiveClient extends AbstractLiveClient {
     super(options);
     this.baseUrl = options.agent?.websocket?.options?.url ?? DEFAULT_AGENT_URL;
 
+    // Initialize health monitoring
+    this.initializeHealthMonitoring("agent");
+
     this.connect({}, endpoint);
   }
 
@@ -42,6 +45,11 @@ export class AgentLiveClient extends AbstractLiveClient {
    * @param event - The MessageEvent object representing the received message.
    */
   protected handleMessage(event: MessageEvent): void {
+    // Record activity for health monitoring
+    if (this.connectionHealth) {
+      this.connectionHealth.recordActivity();
+    }
+
     if (typeof event.data === "string") {
       try {
         const data = JSON.parse(event.data);
@@ -166,5 +174,28 @@ export class AgentLiveClient extends AbstractLiveClient {
    */
   public keepAlive(): void {
     this.send(JSON.stringify({ type: "KeepAlive" }));
+  }
+
+  /**
+   * Gets the namespace for this client.
+   * @returns The namespace (agent)
+   */
+  protected getNamespace(): string {
+    return "agent";
+  }
+
+  /**
+   * Get the default KeepAlive interval for Agent connections
+   * Returns 8000ms (8 seconds) for Agent-specific timing
+   */
+  protected getDefaultKeepAliveInterval(): number {
+    return 8000;
+  }
+
+  /**
+   * Sends a KeepAlive message for Agent connections.
+   */
+  protected sendKeepAliveMessage(): void {
+    this.keepAlive();
   }
 }
