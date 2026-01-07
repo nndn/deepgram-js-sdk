@@ -14,47 +14,77 @@ type TransportUrl = string;
 
 interface TransportOptions {
   url?: TransportUrl;
+  proxy?: {
+    url: TransportUrl;
+  };
 }
 
-export interface RestOptions {
-  url?: string;
-  headers?: Record<string, string>;
-  timeout?: number;
+interface ITransport<C, O> {
+  client?: C;
+  options?: O;
 }
 
+export type DefaultNamespaceOptions = {
+  key?: string | IKeyFactory;
+  accessToken?: string | IKeyFactory;
+  fetch: {
+    options: { url: TransportUrl };
+  };
+  websocket: {
+    options: { url: TransportUrl };
+  };
+} & NamespaceOptions;
+
+export interface NamespaceOptions {
+  key?: string | IKeyFactory;
+  accessToken?: string | IKeyFactory;
+  fetch?: ITransport<IFetch, TransportFetchOptions>;
+  websocket?: ITransport<IWebSocket, TransportWebSocketOptions>;
+  connectionHealth?: ConnectionHealthOptions;
+}
+
+export type DefaultClientOptions = {
+  global: Partial<DefaultNamespaceOptions>;
+} & DeepgramClientOptions;
+
+/**
+ * Configures options for a Deepgram client.
+ *
+ * The `DeepgramClientOptions` interface defines the configuration options for a Deepgram client. It includes options for various namespaces, such as `global`, `listen`, `manage`, `onprem`, `read`, and `speak`. Each namespace has its own options for configuring the transport, including the URL, proxy, and options for fetch and WebSocket clients.
+ *
+ * The `global` namespace is used to configure options that apply globally to the Deepgram client. The other namespaces are used to configure options specific to different Deepgram API endpoints.
+ * Support introductory formats:
+ * - fetch: FetchOptions;
+ * - _experimentalCustomFetch?: Fetch;
+ * - restProxy?: {
+ *     url: null | string;
+ *   };
+ */
 export interface DeepgramClientOptions {
-  global?: GlobalOptions;
-  transcription?: RestOptions;
-  preRecorded?: RestOptions;
-  live?: RestOptions;
-  read?: RestOptions;
-  pricing?: RestOptions;
-  manage?: RestOptions;
-  members?: RestOptions;
-  usage?: RestOptions;
-  // ... existing options ...
-}
+  key?: string | IKeyFactory;
+  accessToken?: string | IKeyFactory;
+  global?: NamespaceOptions & { url?: string; headers?: { [index: string]: any } };
+  listen?: NamespaceOptions;
+  manage?: NamespaceOptions;
+  onprem?: NamespaceOptions;
+  read?: NamespaceOptions;
+  speak?: NamespaceOptions;
+  agent?: NamespaceOptions;
 
-interface GlobalOptions {
-  key?: string;
-  fetch?: IFetch;
-  websocket?: IWebSocket;
-  headers?: Record<string, string>;
-  url?: string;
-  retry?: RetryOptions;
-}
+  /**
+   * @deprecated as of 3.4, use a namespace like `global` instead
+   */
+  fetch?: FetchOptions;
 
-export interface RetryOptions {
-  minWait?: number;
-  maxWait?: number;
-  retries?: number;
-  backoffFactor?: number;
-}
+  /**
+   * @deprecated as of 3.4, use a namespace like `global` instead
+   */
+  _experimentalCustomFetch?: Fetch;
 
-export namespace DeepgramClientOptions {
-  export interface NamespaceOptions extends RestOptions {
-    connectionHealth?: ConnectionHealthOptions;
-  }
+  /**
+   * @deprecated as of 3.4, use a namespace like `global` instead
+   */
+  restProxy?: {
+    url: null | string;
+  };
 }
-
-export { DeepgramClientOptions };
