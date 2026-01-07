@@ -4,6 +4,8 @@ import type { DeepgramClientOptions, LiveSchema } from "../lib/types";
 import type { WebSocket as WSWebSocket } from "ws";
 import { isBun } from "../lib/runtime";
 import { DeepgramWebSocketError } from "../lib/errors";
+import { ConnectionHealthManager } from "../lib/ConnectionHealthManager";
+import { LiveConnectionHealthEvents } from "../lib/enums/LiveConnectionHealthEvents";
 
 /**
  * Represents a constructor for a WebSocket-like object that can be used in the application.
